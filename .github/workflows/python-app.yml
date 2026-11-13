@@ -1,0 +1,277 @@
+name: 🪟 Build Windows exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:                    # 网页上手动点「Run workflow」
+    inputs:
+      reason:
+        description: "本次手动构建备注"
+        required: false
+        default: manual
+
+permissions:
+  contents: write                        # 发 Release 用；漏了必 403
+
+# 同一个 ref 连续推，取消前一次没跑完的，省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: 跳动爱心                   # ← 只改这一行：exe 主名（支持中文）
+  ENTRY: beat_heart.py                         # ← 入口文件
+  VCREDIT_URL: https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+jobs:
+  build:
+    name: 🧱 ${{ matrix.tag }} (py${{ matrix.py }})
+
+    strategy:
+      fail-fast: false                   # ★ 一个平台炸了，另一个照常发货
+      matrix:
+        include:
+          - { py: "3.11", tag: win10plus, os: windows-latest,
+              note: "Win10/11 + Win8.1 主推包" }
+          - { py: "3.8",  tag: win7,      os: windows-2022,
+              note: "Win7 / Server 2008R2 兼容包" }   # ← 2019 已退役，别写回去
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    # Win7 包要把最低系统版本写进 manifest，Win10+ 包顺手禁掉老系统误装
+    env:
+      TAG: ${{ matrix.tag }}
+      DISTNAME: 跳动爱心_${{ matrix.tag }}
+
+    steps:
+      # ───────────────── 0. 代码 ─────────────────
+      - name: 📥 拉代码
+        uses: actions/checkout@v4
+
+      # ───────────────── 1. Python ─────────────────
+      - name: 🐍 装 Python ${{ matrix.py }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
+          cache: pip
+          cache-dependency-path: |
+            requirements*.txt
+            requirements*.in
+            pyproject.toml
+
+      # ───────────────── 2. 依赖（跨平台，不吃 Mac 的答案）─────────────────
+      - name: 📦 装依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          $srcs = @("requirements/$env:TAG.txt", "requirements/$env:TAG.in",
+                    "requirements.in", "requirements.txt") | Where-Object { Test-Path $_ }
+          if ($srcs) {
+            "装依赖来自: $($srcs[0])" | Write-Host -ForegroundColor Cyan
+            pip install -r $srcs[0] -i https://mirrors.tencent.com/pypi/simple
+          } else {
+            "⚠️ 没找到任何 requirements，按纯标准库项目处理" | Write-Warning
+          }
+          # 打包器单独装，绝不进运行时清单
+          pip install "pyinstaller>=6.4,<7" -i https://mirrors.tencent.com/pypi/simple
+          python -c "import sys;print('解释器',sys.version)"
+
+      # ───────────────── 3. 依赖卫生闸门（标准库 / Mac 幽灵 / 本地路径）─────────────────
+      - name: 🛡️ 依赖清单体检
+        shell: pwsh
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          std = {"os","sys","json","csv","re","math","time","datetime","argparse",
+                 "pathlib","sqlite3","tkinter","logging","zipfile","hashlib","threading",
+                 "subprocess","shutil","socket","urllib","http","email","xml","tomllib",
+                 "pip","setuptools","wheel","pkg_resources","venv","ensurepip"}
+          cands = [pathlib.Path(p) for p in ("requirements.in",
+                                             f"requirements/{__import__('os').environ['TAG']}.in",
+                                             f"requirements/{__import__('os').environ['TAG']}.txt")]
+          bad = []
+          for f in [p for p in cands if p.exists()]:
+              for line in f.read_text(encoding="utf-8").splitlines():
+                  head = line.split("#")[0].strip()
+                  if not head: continue
+                  pkg = head.split("=")[0].split("[")[0].split(">")[0].split("<")[0].split(";")[0].strip().lower()
+                  if pkg in std: bad.append(f"{f}:{head}  ← 标准库，删掉")
+                  if "@ file://" in head: bad.append(f"{f}:{head}  ← 本地路径，Windows 必炸")
+          if bad:
+              print("☠️ 依赖清单有问题：", *bad, sep="\n  "); sys.exit(1)
+          print("✅ 依赖清单干净")
+          PY
+
+      # ───────────────── 4. manifest（决定 Win7 能不能过 AppCompat）─────────────────
+      - name: 📝 生成 app.manifest
+        shell: pwsh
+        run: |
+          if ($env:TAG -eq 'win7') {
+            # Win7 包：声明 Vista/7/8/8.1/10 全支持，asInvoker 不弹 UAC
+            @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <assemblyIdentity type="win32" name="MyApp" version="1.0.0.0" processorArchitecture="amd64"/>
+            <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+              <application>
+                <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+                <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+                <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+                <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+                <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+              </application>
+            </compatibility>
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+              <security><requestedPrivileges>
+                <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+              </requestedPrivileges></security>
+            </trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+                <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+              </windowsSettings>
+            </application>
+          </assembly>
+          '@ | Set-Content -Encoding UTF8 app.manifest
+          } else {
+            @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <assemblyIdentity type="win32" name="MyApp" version="1.0.0.0" processorArchitecture="amd64"/>
+            <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+              <application>
+                <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+                <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+              </application>
+            </compatibility>
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+              <security><requestedPrivileges>
+                <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+              </requestedPrivileges></security>
+            </trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+                <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+                <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+              </windowsSettings>
+            </application>
+          </assembly>
+          '@ | Set-Content -Encoding UTF8 app.manifest
+          }
+          Get-Content app.manifest | Select-Object -First 3
+
+      # ───────────────── 5. 打包 ─────────────────
+      - name: 🔨 PyInstaller 打包（${{ matrix.note }}）
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"                # ★ 中文文件名/资源的保命符
+          PYTHONIOENCODING: utf-8
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $gui = if (Test-Path "assets/icon.ico") { "--windowed --icon assets/icon.ico" } else { "--console" }
+          $data = if (Test-Path "assets") { "--add-data `"assets;assets`"" } else { "" }
+          # Win7 / 精简版 / 只读 %TEMP% 场景下 --onefile 会翻车 → 统一 onedir，再压 zip
+          $cmd = "pyinstaller --noconfirm --clean --onedir --manifest app.manifest " +
+                 "--name `"$env:DISTNAME`" $gui $data " +
+                 "--collect-all PIL " +                       # 按需增删 ↓
+                 "--hidden-import yaml._yaml " +
+                 "--hidden-import xlrd " +
+                 "${{ env.ENTRY }}"
+          Write-Host "> $cmd" -ForegroundColor Cyan
+          Invoke-Expression $cmd
+
+          if (-not (Test-Path "dist/$env:DISTNAME/$env:DISTNAME.exe")) {
+            Get-ChildItem dist -Recurse | Select-Object FullName
+            throw "☠️ dist 里没找到 exe，打包失败"
+          }
+
+      # ───────────────── 6. 纯净环境冒烟（绿勾才算数）─────────────────
+      - name: 🧪 空目录冒烟测试
+        shell: pwsh
+        env: { PYTHONUTF8: "1" }
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP "smoke"
+          New-Item -ItemType Directory -Force $smoke | Out-Null
+          Copy-Item "dist/$env:DISTNAME/*" $smoke -Recurse -Force
+          Push-Location $smoke
+          & ".\$env:DISTNAME.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "☠️ 无 Python 环境下跑挂了：多半 hidden-import 漏了或路径写死" }
+          Pop-Location
+          "{0:N1} MB" -f ((Get-ChildItem "dist/$env:DISTNAME" -Recurse -File |
+                          Measure-Object Length -Sum).Sum/1MB)
+
+      # ───────────────── 7. VC++ 运行库（带重试 + SHA-256 校验）─────────────────
+      - name: 📥 拉 VC++ 运行库并校验
+        shell: pwsh
+        run: |
+          $out = "dist/$env:DISTNAME/vc_redist.x64.exe"
+          $ok  = $false
+          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+            try {
+              Invoke-WebRequest -Uri $env:VCREDIT_URL -OutFile $out -UseBasicParsing -TimeoutSec 120
+              $len = (Get-Item $out).Length
+              $sig = (Get-AuthenticodeSignature $out).Status
+              "第 $i 次: {0:N2} MB, 签名=$sig" -f ($len/1MB)
+              # 闸门：>15MB 且 Authenticode 有效，才认它是真运行库
+              if ($len -gt 15MB -and $sig -eq 'Valid') { $ok = $true }
+              else { Start-Sleep -Seconds 5 }
+            } catch { "第 $i 次失败: $_"; Start-Sleep -Seconds 10 }
+          }
+          if (-not $ok) { throw "☠️ vc_redist 拿不到或签名异常，宁可不发也不发坏包" }
+          (Get-AuthenticodeSignature $out).SignerCertificate.Subject
+
+      # ───────────────── 8. 说明文件 + 组装 zip ─────────────────
+      - name: 📦 组装交付 zip
+        shell: pwsh
+        run: |
+          $isWin7 = $env:TAG -eq 'win7'
+          $note = if ($isWin7) {
+            "此包基于 Python 3.8 构建，兼容 Windows 7 SP1 / Server 2008 R2 及以上。`n`n首次使用请先双击 vc_redist.x64.exe（约 30 秒，无需重启），`n再运行 $env:DISTNAME.exe。`n若提示缺少 api-ms-win-core-path-l1-1-0.dll，说明你下错了包，请改用 win10plus 版。"
+          } else {
+            "此包基于 Python 3.11 构建，适用 Windows 10 / 11 / 8.1。`n`nWindows 7 及更早系统无法运行，请下载 win7 版。`n首次运行若提示缺少 vcruntime140_1.dll，先装 vc_redist.x64.exe（本目录内，30 秒）。`n配置与日志写在 %APPDATA%\$env:APP_NAME，卸载直接删文件夹即可。"
+          }
+          $readme = "════════════════════════════════`n  $env:APP_NAME  $env:TAG 版`n  构建: ${{ github.ref_name }} / ${{ github.sha }}`n  Python: ${{ matrix.py }}  平台: x64`n════════════════════════════════`n`n$note`n`n—— 常见疑问 ——`n· 杀软报毒？PyInstaller 单目录包的通病，点「允许」，或加白名单。`n· 双击没反应？先在项目外开 cmd，把 exe 拖进去回车，看报错文字。`n· 没有管理员权限？本程序 asInvoker，不需要 UAC，别用「以管理员身份运行」。"
+          Set-Content -Encoding UTF8 "dist/$env:DISTNAME/使用说明.txt" $readme
+          if (Test-Path "LICENSE") { Copy-Item LICENSE "dist/$env:DISTNAME\" }
+
+          $zip = "$env:APP_NAME`_v${{ github.ref_name }}_$env:TAG.zip"
+          Compress-Archive "dist/$env:DISTNAME/*" $zip -Force
+          "ZIP → $zip  ({0:N1} MB)" -f ((Get-Item $zip).Length/1MB) | Write-Host -ForegroundColor Green
+          Add-Content $env:GITHUB_OUTPUT "zip=$zip"
+        id: pack
+
+      # ───────────────── 9. 产物（名字带 tag，绝不 409）─────────────────
+      - name: 📤 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.tag }}-win64      # ★ 必须含 matrix
+          path: ${{ steps.pack.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14                                     # 省 500MB 存储额度
+
+  # ───────────── 10. 汇总发 Release（等两个 job 都完事儿）─────────────
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - name: 🚀 发 Release（两个 zip 挂同一个版本下）
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+          body: |
+            ## 下载哪个？
+            | 你的系统 | 下这个 |
+            |---|---|
+            | Windows 10 / 11 / 8.1 | `*_win10plus.zip` ← **大多数人选它** |
+            | Windows 7 SP1 / Server 2008 R2 | `*_win7.zip` |
+            | 骁龙 X / ARM 平板 | `win10plus` 版（走 Prism x64 模拟，够用） |
+
+            两个包里都已内含 `vc_redist.x64.exe` 和 `使用说明.txt`，**解压后先装运行库再运行 exe**。
