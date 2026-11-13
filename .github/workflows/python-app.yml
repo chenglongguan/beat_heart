@@ -1,16 +1,24 @@
-name: Build Windows EXE (Win7+)
+name: Build & Publish Windows EXE (Win7+)
 
-# 触发方式：打 tag（自动发 Release）／手动点击 Run workflow／推送 main
+# 触发方式：推 main / 打 tag / 手动运行
 on:
   push:
     branches: [main, master]
     tags: ['v*']
+    # 机器人回推 dist/ 的提交不再触发构建，避免自激
+    paths-ignore:
+      - 'dist/**'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  PYTHON_VERSION: '3.8.10'
+  PYINSTALLER_VERSION: '6.22.3'
+
 jobs:
+  # ---------- 1. 编译 ----------
   build:
     name: Build ${{ matrix.tag }}
     runs-on: windows-2022
@@ -18,34 +26,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # win32 版在 32 位和 64 位 Win7 上都能跑，兼容性最好，作为默认分发版本
+          # win32 版在 32 位和 64 位 Win7 上都能跑，兼容性最好
           - arch: x86
             tag: win32
             ucrt: x86
-          # win64 版仅供 64 位系统使用，性能略好
           - arch: x64
             tag: win64
             ucrt: x64
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # Win7 只能吃 Python 3.8（3.9 起官方最低 Win8.1）。
-      # 必须写全 3.8.10：Python 官方只给 3.8.10 出了 Windows 安装包，写 '3.8' 会解析到
+      # 必须写全 3.8.10：官方只给 3.8.10 出了 Windows 安装包，写 '3.8' 会解析到
       # 无 Windows 二进制的 3.8.1x 而报 "Version 3.8 was not found"。
-      - name: Setup Python 3.8.10 ${{ matrix.arch }}
+      - name: Setup Python ${{ env.PYTHON_VERSION }} ${{ matrix.arch }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.8.10'
+          python-version: ${{ env.PYTHON_VERSION }}
           architecture: ${{ matrix.arch }}
 
       - name: Install PyInstaller
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "pyinstaller==6.22.3"
+          python -m pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
 
-      # 先确认 runner 的 Python 自带 Tcl/Tk，否则打出来的包在别人机器上会报 Tcl/Tk initialization failed
       - name: Verify tkinter
         run: python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.TkVersion)"
 
@@ -62,7 +67,7 @@ jobs:
           )
 
           # Win7 SP1 若没装 KB2999226，会缺 api-ms-win-crt-*.dll / ucrtbase.dll。
-          # 从 runner 上的 Windows SDK 里把 UCRT 一并塞进 exe，目标机就不用再装补丁。
+          # 从 runner 的 Windows SDK 里把 UCRT 一并塞进 exe。
           $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Redist'
           if (Test-Path $kits) {
             $ver = Get-ChildItem $kits -Directory -ErrorAction SilentlyContinue |
@@ -88,11 +93,10 @@ jobs:
           python -m PyInstaller @pyArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Smoke test (exe exists + hash)
+      - name: Smoke test
         shell: pwsh
         run: |
           if (-not (Test-Path 'dist/BeatHeart.exe')) { throw 'dist/BeatHeart.exe not found' }
-          Get-Item 'dist/BeatHeart.exe' | Select-Object Name, Length
           Get-FileHash 'dist/BeatHeart.exe' -Algorithm SHA256 | Format-List
 
       - name: Upload artifact
@@ -102,8 +106,60 @@ jobs:
           path: dist/BeatHeart.exe
           if-no-files-found: error
 
+  # ---------- 2. 把 exe 提交回仓库 + 更新滚动 Release ----------
+  publish:
+    name: Publish to repo
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Commit files to dist/
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item 'artifacts/BeatHeart-win32/BeatHeart.exe' 'dist/BeatHeart-win32.exe' -Force
+          Copy-Item 'artifacts/BeatHeart-win64/BeatHeart.exe' 'dist/BeatHeart-win64.exe' -Force
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist
+
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "dist/ 无变化，跳过提交"
+            exit 0
+          }
+
+          git commit -m "chore(dist): 更新打包产物 [skip ci]"
+          # 并发构建时可能落后于远端，rebase 后重推一次
+          git pull --rebase origin ${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
+
+      # 每次构建都刷新一个 latest 发布，方便直接下载，不用翻 Actions
+      - name: Update rolling release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>$null | Out-Null
+          gh release create latest dist/BeatHeart-win32.exe dist/BeatHeart-win64.exe `
+            --title "最新构建 Latest build" `
+            --notes "自动构建，来源提交 ${{ github.sha }}。Windows 7 SP1 及以上可用；优先用 win32 版。"
+
+  # ---------- 3. 打 tag 时额外发正式 Release（zip 包） ----------
   release:
-    name: Publish Release
+    name: Release for tag
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -113,19 +169,22 @@ jobs:
         with:
           path: artifacts
 
-      # 打包成 zip 再发：微信/QQ/邮箱传裸 exe 常被拦，压缩包更容易过
+      # 压缩成 zip 再发：微信/QQ/邮箱传裸 exe 常被拦
       - name: Zip artifacts
         run: |
           cd artifacts
-          for d in */; do
-            (cd "$d" && zip -9 -r "../${d%/}.zip" .)
-          done
+          mkdir -p ../out
+          cp BeatHeart-win32/BeatHeart.exe ../out/BeatHeart-win32.exe
+          cp BeatHeart-win64/BeatHeart.exe ../out/BeatHeart-win64.exe
+          cd ../out
+          zip -9 BeatHeart-win32.zip BeatHeart-win32.exe
+          zip -9 BeatHeart-win64.zip BeatHeart-win64.exe
           ls -lh
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: out/*.zip
           generate_release_notes: true
           body: |
             Windows 7 SP1 及以上可用。
